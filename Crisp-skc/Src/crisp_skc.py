@@ -1,4 +1,3 @@
---- START OF FILE fixed_skc_library.py ---
 
 #!/usr/bin/env python3
 """
@@ -984,5 +983,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
---- END OF FILE fixed_skc_library.py ---
