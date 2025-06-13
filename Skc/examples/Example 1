@@ -1,0 +1,20 @@
+import asyncio
+from src.crisp_skc import OptimizedSKCCore, CognitivePacket, MessageType, ResourceType
+
+async def main():
+    skc = OptimizedSKCCore()
+    resource_id = await skc.register_resource(
+        full_address="https://example.com/models/domainA14_v2.bin",
+        resource_type=ResourceType.MODEL,
+        metadata={"version": "2.0.1"}
+    )
+    cp = CognitivePacket(
+        dest="X12.09.78", msg_type=MessageType.QUERY,
+        sender="E13.54.78.9.7y.x3.f9",
+        payload={"query": "analyze_resonance"}
+    )
+    response = await skc.process_packet(cp, access_role="researcher")
+    print(response.to_binary_format().hex()[:100] + "...")
+
+if __name__ == "__main__":
+    asyncio.run(main())
