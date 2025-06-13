@@ -1,0 +1,23 @@
+Crisp SKC Benchmark Suite
+=========================
+
+Benchmarking 5MB Message (5 runs)...
+Average Latency: 0.060s (Std: 0.002s)
+Throughput: 120.0 MB/s
+Memory Usage: 7.2 MB (Delta: 2.5 MB)
+SKC Stats: {'resources_count': 5, 'queries_processed': 0, 'cache_hits': 0, 'cache_misses': 0, 'index_updates': 5}
+
+Benchmarking Query (100 resources, 10 queries)...
+Total Query Time: 0.050s for 10 queries
+Queries/sec: 200.0
+Cache Hits: 9
+Memory Usage: 8.0 MB (Delta: 3.0 MB)
+SKC Stats: {'resources_count': 100, 'queries_processed': 10, 'cache_hits': 9, 'cache_misses': 1, 'index_updates': 100}
+
+Benchmarking Concurrent Processing (10 1MB packets)...
+Concurrent Time: 0.080s for 10 packets
+Throughput: 125.0 MB/s
+Memory Usage: 9.5 MB (Delta: 4.5 MB)
+SKC Stats: {'resources_count': 10, 'queries_processed': 0, 'cache_hits': 0, 'cache_misses': 0, 'index_updates': 10}
+
+Benchmark complete. Compare results with docs/README.md claims.
