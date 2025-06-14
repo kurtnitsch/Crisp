@@ -1,0 +1,119 @@
+# tests/test_vetkey.py
+import pytest
+from crisp_skc import VetKey, MockVetKey, CryptoError
+
+def test_vetkey_sign_verify():
+    vetkey = VetKey()
+    data = b"test data"
+    signature = vetkey.sign(data)
+    public_key = vetkey.signing_public_bytes()
+    assert VetKey.verify(signature, data, public_key) is True
+
+def test_vetkey_verify_failure():
+    vetkey = VetKey()
+    data = b"test data"
+    signature = vetkey.sign(data)
+    assert VetKey.verify(signature, b"tampered data", vetkey.signing_public_bytes()) is False
+
+def test_vetkey_ratchet_forward():
+    vetkey = VetKey()
+    initial_epoch = vetkey.epoch
+    vetkey.ratchet_forward()
+    assert vetkey.epoch == initial_epoch + 1
+
+def test_mock_vetkey():
+    vetkey = MockVetKey()
+    data = b"test data"
+    signature = vetkey.sign(data)
+    assert MockVetKey.verify(signature, data, vetkey.signing_public_bytes()) is True
+
+def test_vetkey_error_handling():
+    if not CRYPTO_AVAILABLE:
+        with pytest.raises(RuntimeError):
+            VetKey()
+    else:
+        vetkey = VetKey()
+        with pytest.raises(TypeError):
+            vetkey.sign("not bytes")
+
+# tests/test_cognitive_packet.py
+import pytest
+from crisp_skc import CognitivePacket, MessageType, SerializationError
+
+def test_packet_serialization_roundtrip():
+    original = CognitivePacket(
+        dest="node1",
+        msg_type=MessageType.DATA,
+        sender="node2",
+        payload={"key": "value"},
+        binary_payload=b"\x01\x02\x03"
+    )
+    serialized = original.to_binary_format()
+    deserialized = CognitivePacket.from_binary_format(serialized)
+    
+    assert deserialized.dest == original.dest
+    assert deserialized.msg_type == original.msg_type
+    assert deserialized.payload == original.payload
+    assert deserialized.binary_payload == original.binary_payload
+
+def test_packet_signature_verification():
+    packet = CognitivePacket(dest="node1", msg_type=MessageType.DATA, sender="node2")
+    vetkey = VetKey() if CRYPTO_AVAILABLE else MockVetKey()
+    packet.sign_with_vetkey(vetkey)
+    assert packet.verify_vet_signature() is True
+
+def test_invalid_packet_deserialization():
+    with pytest.raises(SerializationError):
+        CognitivePacket.from_binary_format(b"invalid data")
+    
+    with pytest.raises(SerializationError):
+        CognitivePacket.from_binary_format(struct.pack('!III', 10, 10, 10) + b"a"*30)
+
+def test_packet_edge_cases():
+    # Empty packet
+    packet = CognitivePacket(dest="", msg_type=MessageType.ACK, sender="")
+    serialized = packet.to_binary_format()
+    deserialized = CognitivePacket.from_binary_format(serialized)
+    assert deserialized.dest == ""
+    
+    # Large binary payload
+    large_data = b"\x00" * (MAX_PACKET_SIZE - 100)
+    packet = CognitivePacket(
+        dest="node1",
+        msg_type=MessageType.DATA,
+        sender="node2",
+        binary_payload=large_data
+    )
+    serialized = packet.to_binary_format()
+    assert len(serialized) > MAX_PACKET_SIZE - 100
+
+# tests/test_performance.py
+import timeit
+from crisp_skc import CognitivePacket, MessageType, BF16Vector
+
+def benchmark_packet_serialization():
+    setup = """
+from crisp_skc import CognitivePacket, MessageType
+packet = CognitivePacket(
+    dest="node1",
+    msg_type=MessageType.DATA,
+    sender="node2",
+    payload={"key": "value", "nested": {"array": [1, 2, 3]}},
+    binary_payload=b"\\x01\\x02\\x03" * 1000
+)
+    """
+    return timeit.timeit("packet.to_binary_format()", setup=setup, number=1000)
+
+def benchmark_vector_operations():
+    setup = """
+from crisp_skc import BF16Vector
+import numpy as np
+data = np.random.rand(1024).astype(np.float32)
+vector = BF16Vector(data)
+vector2 = BF16Vector(data)
+    """
+    return {
+        "to_float32": timeit.timeit("vector.to_float32()", setup=setup, number=1000),
+        "cosine_similarity": timeit.timeit("vector.cosine_similarity(vector2)", setup=setup, number=1000),
+        "creation": timeit.timeit("BF16Vector(data)", setup=setup, number=1000)
+    }
