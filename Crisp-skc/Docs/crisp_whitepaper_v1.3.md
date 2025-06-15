@@ -119,7 +119,7 @@ class MyExplorerAgent(PondAgent):
 
 The future of Crisp is collaborative.
 
-Discord: [Hypothetical Discord Link] — Ask questions, share your creations, find collaborators.
+— Ask questions, share your creations, find collaborators.
 
 GitHub: Found a bug? Have a feature idea? Open an issue or submit a pull request.
 
