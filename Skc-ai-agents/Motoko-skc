@@ -1,0 +1,466 @@
+import Trie "mo:base/Trie";
+import Buffer "mo:base/Buffer";
+import Array "mo:base/Array";
+import Principal "mo:base/Principal";
+import Time "mo:base/Time";
+import Int "mo:base/Int";
+import Float "mo:base/Float";
+import Text "mo:base/Text";
+import Hash "mo:base/Hash";
+import Blob "mo:base/Blob";
+import Iter "mo:base/Iter";
+import Debug "mo:base/Debug";
+
+actor class SmallPond(pondId : Text) = self {
+  // ============================================================================
+  // Protocol Enums
+  // ============================================================================
+  public type MessageType = {
+    #QUERY;
+    #DATA;
+    #EXEC;
+    #COMMAND;
+    #ACK;
+    #ERROR;
+    #UPDATE;
+    #DISCOVER;
+    #POND;
+    #KIP_CLAIM;
+    #KIP_VOTE;
+    #KIP_QUERY;
+    #KIP_RESPONSE;
+  };
+
+  public type ResourceType = {
+    #DATA;
+    #MODEL;
+    #WASM;
+    #KNOWLEDGE;
+  };
+
+  public type KnowledgeClaimStatus = {
+    #PENDING;
+    #ACCEPTED;
+    #REJECTED;
+    #EXPIRED;
+  };
+
+  public type KnowledgeTrustLevel = {
+    #UNVERIFIED;
+    #WEAK;
+    #MODERATE;
+    #STRONG;
+    #VERIFIED;
+  };
+
+  // ============================================================================
+  // Data Structures
+  // ============================================================================
+  public type BF16Vector = {
+    data : [Nat8];
+  };
+
+  public type KnowledgeClaim = {
+    claimId : Text;
+    content : Text;
+    authorId : ?Principal;
+    timestamp : Int;
+    expiration : Int;
+    vector : BF16Vector;
+    votes : [(Principal, Bool)];
+    status : KnowledgeClaimStatus;
+    confidence : Float;
+    trustLevel : KnowledgeTrustLevel;
+    supportingClaims : [Text];
+    refutingClaims : [Text];
+  };
+
+  public type CognitivePacket = {
+    dest : Principal;
+    msgType : MessageType;
+    sender : Principal;
+    msgId : Text;
+    timestamp : Int;
+    hops : Nat;
+    payload : ?[Nat8]; // Serialized payload data
+    binaryPayload : ?[Nat8];
+    vetSignature : ?[Nat8];
+    vetPublicKey : ?[Nat8];
+    vetEpoch : ?Nat;
+  };
+
+  // ============================================================================
+  // Protocol Constants
+  // ============================================================================
+  let MAX_HOPS : Nat = 15;
+  let MAX_POND_AGENTS = 100;
+  let KIP_CONSENSUS_THRESHOLD : Float = 0.6;
+  let KIP_CLAIM_EXPIRATION_SECONDS : Int = 30 * 24 * 3600; // 30 days
+
+  // ============================================================================
+  // State Variables
+  // ============================================================================
+  stable var agents : Trie.Trie<Principal, ()> = Trie.empty();
+  stable var claims : Trie.Trie<Text, KnowledgeClaim> = Trie.empty();
+  stable var claimIndex : Trie.Trie<Text, [Text]> = Trie.empty();
+  stable var nextConsensusTime : Int = 0;
+  let CONSENSUS_INTERVAL : Int = 5 * 1_000_000_000; // 5 seconds in nanoseconds
+
+  // ============================================================================
+  // Agent Management
+  // ============================================================================
+  public shared ({ caller }) func join() : async () {
+    if (Trie.size(agents) >= MAX_POND_AGENTS) {
+      Debug.trap("Pond is full");
+    };
+    agents := Trie.put(
+      agents,
+      { key = caller; hash = Principal.hash(caller) },
+      Principal.equal,
+      ()
+    ).0;
+  };
+
+  public shared ({ caller }) func leave() : async () {
+    agents := Trie.remove(
+      agents,
+      { key = caller; hash = Principal.hash(caller) },
+      Principal.equal
+    ).0;
+  };
+
+  func isAgent(p : Principal) : Bool {
+    Trie.get(agents, { key = p; hash = Principal.hash(p) }, Principal.equal) != null;
+  };
+
+  // ============================================================================
+  // Knowledge Claim Management
+  // ============================================================================
+  public shared ({ caller }) func createClaim(content : Text, vector : [Nat8]) : async Text {
+    assert isAgent(caller);
+    
+    let claimId = await generateUUID();
+    let now = Time.now();
+    
+    let claim : KnowledgeClaim = {
+      claimId = claimId;
+      content = content;
+      authorId = ?caller;
+      timestamp = now;
+      expiration = now + KIP_CLAIM_EXPIRATION_SECONDS * 1_000_000_000;
+      vector = { data = vector };
+      votes = [];
+      status = #PENDING;
+      confidence = 0.5;
+      trustLevel = #UNVERIFIED;
+      supportingClaims = [];
+      refutingClaims = [];
+    };
+    
+    claims := Trie.put(
+      claims,
+      { key = claimId; hash = Text.hash(claimId) },
+      Text.equal,
+      claim
+    ).0;
+    
+    // Update content index
+    let contentHash = hashContent(content);
+    let existing = switch (Trie.get(claimIndex, { key = contentHash; hash = Text.hash(contentHash) }, Text.equal)) {
+      case (?list) list;
+      case null { [] };
+    };
+    claimIndex := Trie.put(
+      claimIndex,
+      { key = contentHash; hash = Text.hash(contentHash) },
+      Text.equal,
+      Array.append(existing, [claimId])
+    ).0;
+    
+    // Broadcast claim notification
+    ignore broadcast(#KIP_CLAIM, {
+      claimId = claimId;
+      contentHash = contentHash;
+      author = Principal.toText(caller);
+      timestamp = now;
+    });
+    
+    claimId;
+  };
+
+  public shared ({ caller }) func castVote(claimId : Text, vote : Bool) : async () {
+    assert isAgent(caller);
+    
+    switch (Trie.get(claims, { key = claimId; hash = Text.hash(claimId) }, Text.equal)) {
+      case (?claim) {
+        if (claim.authorId == ?caller) return; // Can't vote on own claim
+        if (hasVoted(claim, caller)) return; // Already voted
+        
+        // Add vote
+        let newVotes = Array.append(claim.votes, [(caller, vote)]);
+        let newClaim = updateClaimStatus({ claim with votes = newVotes });
+        
+        claims := Trie.put(
+          claims,
+          { key = claimId; hash = Text.hash(claimId) },
+          Text.equal,
+          newClaim
+        ).0;
+        
+        // Broadcast vote
+        ignore broadcast(#KIP_VOTE, {
+          claimId = claimId;
+          vote = vote;
+          voter = Principal.toText(caller);
+          newStatus = claimStatusToText(newClaim.status);
+        });
+      };
+      case null { /* Claim not found */ };
+    };
+  };
+
+  func updateClaimStatus(claim : KnowledgeClaim) : KnowledgeClaim {
+    if (isExpired(claim)) {
+      return { claim with status = #EXPIRED };
+    };
+    
+    let acceptCount = Array.filter(claim.votes, func((_, v) : Bool = v).size();
+    let totalVotes = claim.votes.size();
+    
+    let confidence = if (totalVotes > 0) {
+      Float.fromInt(acceptCount) / Float.fromInt(totalVotes)
+    } else {
+      0.5
+    };
+    
+    let (status, trustLevel) = if (totalVotes >= 3 and confidence >= KIP_CONSENSUS_THRESHOLD) {
+      (#ACCEPTED, #STRONG)
+    } else if (totalVotes >= 3 and (1.0 - confidence) >= KIP_CONSENSUS_THRESHOLD) {
+      (#REJECTED, #UNVERIFIED)
+    } else if (totalVotes >= 5 and claim.status == #ACCEPTED) {
+      (#ACCEPTED, #VERIFIED)
+    } else {
+      (claim.status, claim.trustLevel)
+    };
+    
+    { 
+      claim with 
+      confidence = confidence;
+      status = status;
+      trustLevel = trustLevel;
+    }
+  };
+
+  func isExpired(claim : KnowledgeClaim) : Bool {
+    Time.now() > claim.expiration
+  };
+
+  func hasVoted(claim : KnowledgeClaim, agent : Principal) : Bool {
+    Option.isSome(Array.find(claim.votes, func((p, _) : Bool = p == agent))
+  };
+
+  // ============================================================================
+  // Query Functions
+  // ============================================================================
+  public query func getClaims(
+    contentHash : ?Text,
+    author : ?Principal,
+    status : ?KnowledgeClaimStatus
+  ) : async [KnowledgeClaim] {
+    let allClaims = Trie.toArray<Text, KnowledgeClaim, KnowledgeClaim>(
+      claims,
+      func(k, v) { v }
+    );
+    
+    Array.filter(allClaims, func(claim : KnowledgeClaim) : Bool {
+      let contentMatch = switch (contentHash) {
+        case (?h) hashContent(claim.content) == h;
+        case null true;
+      };
+      
+      let authorMatch = switch (author) {
+        case (?a) claim.authorId == ?a;
+        case null true;
+      };
+      
+      let statusMatch = switch (status) {
+        case (?s) claim.status == s;
+        case null true;
+      };
+      
+      contentMatch and authorMatch and statusMatch
+    })
+  };
+
+  public query func getConsensusReport() : async {
+    totalClaims : Nat;
+    statusCounts : [(Text, Nat)];
+    trustLevels : [(Text, Nat)];
+    avgVotes : Float;
+    pendingClaims : Nat;
+  } {
+    let allClaims = Trie.toArray<Text, KnowledgeClaim, KnowledgeClaim>(
+      claims,
+      func(k, v) { v }
+    );
+    
+    var statusCounts = [
+      ("PENDING", 0),
+      ("ACCEPTED", 0),
+      ("REJECTED", 0),
+      ("EXPIRED", 0)
+    ];
+    
+    var trustLevels = [
+      ("UNVERIFIED", 0),
+      ("WEAK", 0),
+      ("MODERATE", 0),
+      ("STRONG", 0),
+      ("VERIFIED", 0)
+    ];
+    
+    var voteTotal = 0;
+    var pending = 0;
+    
+    for (claim in allClaims.vals()) {
+      // Update status counts
+      let statusText = claimStatusToText(claim.status);
+      statusCounts := Array.map(statusCounts, func((t, c) : (Text, Nat) {
+        if (t == statusText) (t, c + 1) else (t, c)
+      });
+      
+      // Update trust levels
+      let trustText = trustLevelToText(claim.trustLevel);
+      trustLevels := Array.map(trustLevels, func((t, c) : (Text, Nat) {
+        if (t == trustText) (t, c + 1) else (t, c)
+      });
+      
+      // Update vote totals
+      voteTotal += claim.votes.size();
+      
+      // Count pending claims
+      if (claim.status == #PENDING) pending += 1;
+    };
+    
+    let avgVotes = if (allClaims.size() > 0) {
+      Float.fromInt(voteTotal) / Float.fromInt(allClaims.size())
+    } else {
+      0.0
+    };
+    
+    {
+      totalClaims = allClaims.size();
+      statusCounts;
+      trustLevels;
+      avgVotes;
+      pendingClaims = pending;
+    }
+  };
+
+  // ============================================================================
+  // System Functions
+  // ============================================================================
+  public func heartbeat() : async () {
+    let now = Time.now();
+    
+    // Build consensus periodically
+    if (now >= nextConsensusTime) {
+      await buildConsensus();
+      nextConsensusTime := now + CONSENSUS_INTERVAL;
+    };
+    
+    // Clean up expired claims
+    await cleanExpiredClaims();
+  };
+
+  func buildConsensus() : async () {
+    let report = await getConsensusReport();
+    
+    // Broadcast consensus report
+    ignore broadcast(#KIP_RESPONSE, {
+      consensusReport = {
+        totalClaims = report.totalClaims;
+        statusCounts = report.statusCounts;
+        trustLevels = report.trustLevels;
+        avgVotes = report.avgVotes;
+        pendingClaims = report.pendingClaims;
+      };
+    });
+  };
+
+  func cleanExpiredClaims() : async () {
+    let allClaims = Trie.toArray<Text, KnowledgeClaim, (Text, KnowledgeClaim)>(
+      claims,
+      func(k, v) { (k, v) }
+    );
+    
+    for ((claimId, claim) in allClaims.vals()) {
+      if (isExpired(claim)) {
+        claims := Trie.remove(
+          claims,
+          { key = claimId; hash = Text.hash(claimId) },
+          Text.equal
+        ).0;
+      };
+    };
+  };
+
+  // ============================================================================
+  // Utility Functions
+  // ============================================================================
+  func broadcast(msgType : MessageType, data : Blob) : async () {
+    // In a real implementation, this would send to all agents
+    // For demo purposes, we just log the broadcast
+    Debug.print("Broadcasting: " # debug_show (msgType, data));
+  };
+
+  func hashContent(content : Text) : Text {
+    // Using SHA256 for content hashing
+    let hash : [Nat8] = Blob.toArray(Text.encodeUtf8(content));
+    Text.fromIter(Iter.map<Nat8, Char>(hash.vals(), func (b) { 
+      let chars = "0123456789abcdef";
+      chars[Int.abs(Int8.toInt(Int8.fromNat8(b)) / 16)].chars()[0] 
+    }))
+  };
+
+  func claimStatusToText(status : KnowledgeClaimStatus) : Text {
+    switch status {
+      case (#PENDING) "PENDING";
+      case (#ACCEPTED) "ACCEPTED";
+      case (#REJECTED) "REJECTED";
+      case (#EXPIRED) "EXPIRED";
+    }
+  };
+
+  func trustLevelToText(level : KnowledgeTrustLevel) : Text {
+    switch level {
+      case (#UNVERIFIED) "UNVERIFIED";
+      case (#WEAK) "WEAK";
+      case (#MODERATE) "MODERATE";
+      case (#STRONG) "STRONG";
+      case (#VERIFIED) "VERIFIED";
+    }
+  };
+
+  func generateUUID() : async Text {
+    // Simplified UUID generation for Motoko
+    let randomPart = Blob.toArray(await Random.blob(16));
+    Text.concat(
+      "claim-",
+      Text.fromIter(Iter.map<Nat8, Char>(randomPart.vals(), func (b) { 
+        let chars = "0123456789abcdef";
+        chars[Int.abs(Int8.toInt(Int8.fromNat8(b)) % 16].chars()[0] 
+      }))
+    )
+  };
+
+  // ============================================================================
+  // Random Generator (Simple version)
+  // ============================================================================
+  actor class Random() {
+    public func blob(n : Nat) : async Blob {
+      // In a real implementation, use Internet Computer's randomness
+      Blob.fromArray(Array.tabulate(n, func(_) { 0 }));
+    };
+  };
+};
