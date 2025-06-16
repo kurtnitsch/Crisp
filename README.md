@@ -39,7 +39,7 @@
 | Network Payload      | 2.1KB    | 4.8KB    | 2.3x better |
 | Energy Consumption   | 0.05u/t  | 0.12u/t  | 2.4x better |
 
-## Quantum-Ready Security
+## military grade Security ##
 ```python
 # Forward-secure agent identity
 vet_key = VetKey()
